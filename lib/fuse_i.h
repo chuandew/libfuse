@@ -117,6 +117,45 @@ struct fuse_session {
 	 */
 	uint32_t conn_want;
 	uint64_t conn_want_ext;
+
+	/* hot-upgrade controlled drain.
+	 * Independent lock/cond (not mt_lock/mt_finish) to avoid lock-order
+	 * coupling with the worker pool's exit accounting. */
+	_Atomic bool	recv_paused;		/* set: workers stop receiving new requests */
+	_Atomic int	received_inflight;	/* received but not yet processed/replied,
+						 * aggregated across master + clone fuse_devs */
+	_Atomic int	worker_total;		/* workers managed under this session */
+	_Atomic int	reading;		/* workers inside receive/read, not yet returned */
+	_Atomic int	parked;			/* workers settled on drain_cond past the check */
+	_Atomic int	exited_workers;		/* workers that left the work loop */
+	pthread_mutex_t	drain_lock;		/* guards drain_cond waits + drain broadcasts */
+	pthread_cond_t	drain_cond;		/* worker sleep point while paused / drain wakeup */
+	clockid_t	drain_clock;		/* clock drain_cond's timedwait uses; the
+						 * fuse_session_wait_drained() deadline MUST use
+						 * the same clock or the timeout is wrong */
+#ifdef FUSE_TEST_DRAIN_HOOKS
+	/* These hooks are compiled only into the test-only libfuse variant
+	 * (-DFUSE_TEST_DRAIN_HOOKS). They are not part of public ABI and are
+	 * never present in production builds. They exist only to make
+	 * drain-related concurrency races deterministic in tests. */
+	/* Test-only hook fired after a worker receives a request but before it
+	 * processes it, used to deterministically reproduce the drop-on-exit
+	 * race. Never compiled into production builds. */
+	void		(*test_after_receive_hook)(struct fuse_session *se);
+	/* Test-only hook fired at the very top of a worker thread body, before
+	 * it runs any of its loop. A test can gate a spawned worker here to
+	 * simulate "fuse_loop_start_thread succeeded but the new worker has not
+	 * run yet", to prove worker_total counts it synchronously at create
+	 * time (drain race regression). Never compiled into production. */
+	void		(*test_worker_entry_hook)(struct fuse_session *se);
+	/* Test-only hook fired by a worker that is about to park at the pause
+	 * boundary, after parked++ and while holding drain_lock, immediately
+	 * before pthread_cond_wait(). Lets a test capture the parked worker's
+	 * pthread_self() so it can deterministically cancel it inside cond_wait
+	 * (parked-worker cancellation-safety regression). Never compiled into
+	 * production. */
+	void		(*test_pre_park_hook)(struct fuse_session *se);
+#endif
 };
 
 struct fuse_chan {

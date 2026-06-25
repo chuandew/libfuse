@@ -24,6 +24,49 @@ def test_abi():
     cmdline = [ pjoin(basename, 'test', 'test_abi') ]
     subprocess.check_call(cmdline)
 
+def test_wait_drained_timeout():
+    cmdline = [ pjoin(basename, 'test', 'test_wait_drained_timeout') ]
+    subprocess.check_call(cmdline)
+
+def test_reset_clears_drain():
+    cmdline = [ pjoin(basename, 'test', 'test_reset_clears_drain') ]
+    subprocess.check_call(cmdline)
+
+def test_received_inflight():
+    cmdline = [ pjoin(basename, 'test', 'test_received_inflight') ]
+    res = subprocess.run(cmdline)
+    if res.returncode == 77:
+        pytest.skip('no mount capability')
+    assert res.returncode == 0
+
+def test_drop_race():
+    cmdline = [ pjoin(basename, 'test', 'test_drop_race') ]
+    res = subprocess.run(cmdline)
+    if res.returncode == 77:
+        pytest.skip('no mount capability')
+    assert res.returncode == 0
+
+def test_drain_spawn_race():
+    cmdline = [ pjoin(basename, 'test', 'test_drain_spawn_race') ]
+    res = subprocess.run(cmdline)
+    if res.returncode == 77:
+        pytest.skip('no mount capability')
+    assert res.returncode == 0
+
+def test_drain_cancel_safety():
+    cmdline = [ pjoin(basename, 'test', 'test_drain_cancel_safety') ]
+    res = subprocess.run(cmdline)
+    if res.returncode == 77:
+        pytest.skip('no mount capability')
+    assert res.returncode == 0
+
+def test_drain_handoff():
+    cmdline = [ pjoin(basename, 'test', 'test_drain_handoff') ]
+    res = subprocess.run(cmdline)
+    if res.returncode == 77:
+        pytest.skip('no mount capability')
+    assert res.returncode == 0
+
 @pytest.mark.skipif('FUSE_CAP_WRITEBACK_CACHE' not in fuse_caps,
                     reason='not supported by running kernel')
 @pytest.mark.parametrize("writeback", (False, True))

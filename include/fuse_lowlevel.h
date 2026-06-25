@@ -2270,7 +2270,18 @@ int fuse_session_loop(struct fuse_session *se);
 void fuse_session_exit(struct fuse_session *se);
 
 /**
- * Reset the terminated flag of a session
+ * Reset the terminated flag of a session, and clear its controlled-drain state.
+ *
+ * Besides the terminated flag, this clears the controlled-drain state: the
+ * recv_paused flag and the worker_total / exited_workers / parked /
+ * received_inflight / reading counters are returned to their freshly-created
+ * (zero / not-paused) values, so no paused/counter residue from a previous loop
+ * survives. (This does not by itself make the session re-loopable; e.g.
+ * fuse_session_loop_mt() destroys per-loop state on return.)
+ *
+ * Call only when no loop is running and no worker threads are alive (after
+ * fuse_session_loop_mt() / fuse_session_loop() has returned): the clears are
+ * unsynchronised and must race no live worker.
  *
  * @param se the session
  */
@@ -2283,6 +2294,92 @@ void fuse_session_reset(struct fuse_session *se);
  * @return 1 if exited, 0 if not exited
  */
 int fuse_session_exited(struct fuse_session *se);
+
+/**
+ * Pause receiving on a session for a controlled drain (hot-upgrade handoff).
+ *
+ * After this returns, workers stop receiving NEW requests before their next
+ * receive, but every request already received is still fully processed and
+ * replied. The effect is connection-wide: it covers the master fuse_dev and
+ * all clone channels, since all workers share the same recv_paused flag.
+ * Idempotent.
+ *
+ * NOTE: this call does NOT wake a worker already blocked inside read() on
+ * /dev/fuse; setting the flag only stops the NEXT receive. A worker parked in
+ * read() will still return the next request the kernel delivers. The caller
+ * must drive a FUSE round-trip against the mountpoint -- commonly a statfs(2)/df,
+ * though any operation that reaches the filesystem works -- to pop such a
+ * worker back to the recv_paused check, then confirm the safe point with
+ * fuse_session_wait_drained(). received_inflight == 0 alone is NOT a handoff
+ * barrier.
+ *
+ * Like fuse_session_wait_drained(), this is only meaningful while a
+ * fuse_session_loop_mt() is actively running (it acts on that loop generation's
+ * worker pool).
+ *
+ * @param se the session
+ */
+void fuse_session_pause_receive(struct fuse_session *se);
+
+/**
+ * Undo a previous fuse_session_pause_receive(), waking parked workers to resume
+ * receiving. Used to roll back an aborted hot-upgrade handoff. Idempotent.
+ *
+ * @param se the session
+ */
+void fuse_session_resume_receive(struct fuse_session *se);
+
+/**
+ * Return the number of received-but-not-yet-replied requests, aggregated
+ * across the master and all clone channels. This counts only requests already
+ * read from /dev/fuse; it does NOT count a worker still blocked in read(), so
+ * it is necessary but not sufficient for a safe handoff (see
+ * fuse_session_wait_drained()).
+ *
+ * @param se the session
+ * @return the current received-in-flight request count
+ */
+int fuse_session_received_inflight(struct fuse_session *se);
+
+/**
+ * Block until the session reaches a drained, handoff-safe point or the timeout
+ * elapses. The drained condition is, connection-wide (master + all clones):
+ *
+ *   reading == 0                      (no worker inside receive/read)
+ *   received_inflight == 0            (no received request being processed)
+ *   parked + exited_workers == worker_total   (every worker parked or exited)
+ *
+ * Returns -EINVAL unless fuse_session_pause_receive() is in effect
+ * (recv_paused). A 0 return is only a safe handoff point when paused; calling
+ * without pause (e.g. no running loop, where the drained predicate is
+ * trivially true) is rejected with -EINVAL. Because pausing receive cannot
+ * wake a worker already blocked in read(), the caller must keep driving FUSE
+ * round-trips against the mountpoint -- commonly statfs(2)/df, though any
+ * operation that reaches the filesystem works -- to pop blocked readers out
+ * while polling this; this call does not itself wake blocked readers. State
+ * dumps / fd handoff must happen only after this returns 0.
+ *
+ * SCOPE: this is only valid while a fuse_session_loop_mt() is actively running.
+ * The worker_total / parked / exited_workers counters describe the CURRENT loop
+ * generation's worker pool. Before the loop is started, or after it has returned
+ * (fuse_session_reset() clears the drain counters), they are 0, so the drained
+ * predicate is trivially satisfied and the result is meaningless. Call it only
+ * from the orchestration path of a running multi-threaded session.
+ *
+ * The timeout is normally measured against CLOCK_MONOTONIC, so it is
+ * unaffected by wall-clock changes. If the platform could not set up a
+ * CLOCK_MONOTONIC condition variable when the session was created, the wait
+ * transparently falls back to the clock matching the internal condvar
+ * (CLOCK_REALTIME); only in that rare case can a wall-clock jump affect the
+ * timeout.
+ *
+ * @param se the session
+ * @param timeout_ms maximum time to wait, in milliseconds; must be >= 0
+ * @return 0 once drained; -1 on timeout; -EINVAL if timeout_ms < 0 or the
+ *         session is not paused (recv_paused unset); another negative errno if
+ *         the underlying wait fails
+ */
+int fuse_session_wait_drained(struct fuse_session *se, int timeout_ms);
 
 /**
  * Ensure that file system is unmounted.

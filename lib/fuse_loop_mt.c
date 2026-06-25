@@ -126,6 +126,18 @@ static void list_del_worker(struct fuse_worker *w)
 
 static int fuse_loop_start_thread(struct fuse_mt *mt);
 
+/*
+ * Wake anything blocked in fuse_session_wait_drained(): any change to the
+ * drain-relevant counters (reading / received_inflight / parked /
+ * exited_workers) must broadcast so the waiter re-evaluates rather than polls.
+ */
+static void fuse_drain_state_changed(struct fuse_session *se)
+{
+	pthread_mutex_lock(&se->drain_lock);
+	pthread_cond_broadcast(&se->drain_cond);
+	pthread_mutex_unlock(&se->drain_lock);
+}
+
 static void *fuse_do_work(void *data)
 {
 	struct fuse_worker *w = (struct fuse_worker *) data;
@@ -134,12 +146,100 @@ static void *fuse_do_work(void *data)
 
 	fuse_set_thread_name("fuse_worker");
 
+	/*
+	 * worker_total is incremented by fuse_loop_start_thread() under mt_lock
+	 * when this thread was created, not here: counting on thread entry would
+	 * leave a create-vs-pause window (see fuse_loop_start_thread). The
+	 * matching exited_workers++ happens at each exit point below.
+	 */
+
+#ifdef FUSE_TEST_DRAIN_HOOKS
+	/* Test gate: lets a test hold a freshly spawned worker right here, after
+	 * fuse_loop_start_thread() returned (so worker_total already counts it)
+	 * but before it touches the loop, to prove wait_drained() does not
+	 * prematurely report drained for a not-yet-running worker. */
+	if (se->test_worker_entry_hook)
+		se->test_worker_entry_hook(se);
+#endif
+
+	/*
+	 * Workers disable cancellation by default; only the /dev/fuse
+	 * receive/read window below re-enables it (and disables it again right
+	 * after). After receive is paused a worker may park in
+	 * pthread_cond_wait(); if it were cancellable there, a cancel would skip
+	 * the paired parked--/exited_workers++, corrupt the drain accounting, and
+	 * per POSIX could terminate the thread while it holds drain_lock (leaking
+	 * it and wedging every other parked worker's join()). A paused worker is
+	 * instead woken by the drain_cond broadcast that fuse_session_exit()
+	 * issues and exits cleanly. Plain (non-drain) shutdown still interrupts a
+	 * worker blocked in read(), because cancellation is enabled in that
+	 * window.
+	 */
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
 	while (!fuse_session_exited(se)) {
 		int isforget = 0;
 		int res;
 
+		/*
+		 * Controlled drain: once receiving is paused, stop taking new
+		 * work but do not exit the thread (it must be resumable via
+		 * fuse_session_resume_receive()). Park on drain_cond and
+		 * re-evaluate when woken by a resume or by exit. Placed before
+		 * receive so the pause boundary is "stop before the next
+		 * receive"; a worker already blocked inside receive is left to
+		 * finish that request.
+		 */
+		/*
+		 * recv_paused is read seq_cst (paired with the seq_cst stores in
+		 * fuse_session_pause_receive / fuse_session_resume_receive).
+		 * This is NOT what makes the
+		 * handoff safe -- the actual drain barrier is the predicate
+		 * fuse_session_wait_drained() checks (reading == 0 &&
+		 * received_inflight == 0 && parked + exited_workers ==
+		 * worker_total). Even if a freshly created worker momentarily read
+		 * a stale recv_paused == false here, it is already counted in
+		 * worker_total (pre-counted in fuse_loop_start_thread) and is not
+		 * yet parked/exited, and reading++ is published before any receive,
+		 * so wait_drained() cannot report drained while it is in flight.
+		 * seq_cst is kept only to give the flag prompt cross-thread
+		 * visibility so paused workers settle quickly and the drain
+		 * converges; it is a convergence aid, not the correctness barrier.
+		 */
+		if (atomic_load_explicit(&se->recv_paused, memory_order_seq_cst) &&
+		    !fuse_session_exited(se)) {
+			pthread_mutex_lock(&se->drain_lock);
+			atomic_fetch_add_explicit(&se->parked, 1,
+						  memory_order_relaxed);
+			/* parked++ is itself a drain-relevant change. */
+			pthread_cond_broadcast(&se->drain_cond);
+#ifdef FUSE_TEST_DRAIN_HOOKS
+			/* Test hook: this worker is about to cond_wait while
+			 * holding drain_lock; let a test grab its tid to cancel
+			 * it deterministically inside cond_wait. */
+			if (se->test_pre_park_hook)
+				se->test_pre_park_hook(se);
+#endif
+			while (atomic_load_explicit(&se->recv_paused,
+						    memory_order_seq_cst) &&
+			       !fuse_session_exited(se))
+				pthread_cond_wait(&se->drain_cond,
+						  &se->drain_lock);
+			atomic_fetch_sub_explicit(&se->parked, 1,
+						  memory_order_relaxed);
+			pthread_cond_broadcast(&se->drain_cond);
+			pthread_mutex_unlock(&se->drain_lock);
+			continue;
+		}
+
 		pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+		/* reading: this worker has entered the receive/read path and
+		 * has not yet returned; it is neither parked nor processing. */
+		atomic_fetch_add_explicit(&se->reading, 1, memory_order_relaxed);
+		fuse_drain_state_changed(se);
 		res = fuse_session_receive_buf_internal(se, &w->fbuf, w->ch);
+		atomic_fetch_sub_explicit(&se->reading, 1, memory_order_relaxed);
+		fuse_drain_state_changed(se);
 		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 		if (res == -EINTR)
 			continue;
@@ -151,11 +251,29 @@ static void *fuse_do_work(void *data)
 			break;
 		}
 
+		/*
+		 * Successfully received: this request must be processed and
+		 * replied no matter what, even if the session is exiting or
+		 * recv_paused. The early "if (exited) return NULL" that used to
+		 * sit here dropped already-received requests and is removed.
+		 * received_inflight is incremented here (connection-wide:
+		 * master and clone workers share se->received_inflight) and
+		 * decremented once the request has been processed/replied.
+		 *
+		 * No broadcast on the increment (unlike the decrement below): an
+		 * increment can only move the state further from the drained
+		 * predicate (inflight == 0), so no wait_drained() waiter could
+		 * newly become satisfied by it -- waking them would be spurious.
+		 */
+		atomic_fetch_add_explicit(&se->received_inflight, 1,
+					  memory_order_relaxed);
+
+#ifdef FUSE_TEST_DRAIN_HOOKS
+		if (se->test_after_receive_hook)
+			se->test_after_receive_hook(se);
+#endif
+
 		pthread_mutex_lock(&se->mt_lock);
-		if (fuse_session_exited(se)) {
-			pthread_mutex_unlock(&se->mt_lock);
-			return NULL;
-		}
 
 		/*
 		 * This disgusting hack is needed so that zillions of threads
@@ -171,12 +289,21 @@ static void *fuse_do_work(void *data)
 
 		if (!isforget)
 			mt->numavail--;
+		/* Do not grow the worker pool once recv_paused: keeping
+		 * worker_total fixed is what makes the wait_drained condition
+		 * provable. The already-received request below is unaffected. */
 		if (mt->numavail == 0 && mt->numworker < mt->max_threads &&
-		    likely(se->got_init))
+		    likely(se->got_init) &&
+		    !atomic_load_explicit(&se->recv_paused, memory_order_seq_cst))
 			fuse_loop_start_thread(mt);
 		pthread_mutex_unlock(&se->mt_lock);
 
 		fuse_session_process_buf_internal(se, &w->fbuf, w->ch);
+		/* Request has been replied (or was a FORGET needing no reply):
+		 * pair the received_inflight increment from above. */
+		atomic_fetch_sub_explicit(&se->received_inflight, 1,
+					  memory_order_relaxed);
+		fuse_drain_state_changed(se);
 
 		pthread_mutex_lock(&se->mt_lock);
 		if (!isforget)
@@ -190,7 +317,13 @@ static void *fuse_do_work(void *data)
 		 */
 		if (mt->max_idle != -1 && mt->numavail > mt->max_idle && mt->numworker > 1) {
 			if (fuse_session_exited(se)) {
+				/* Safe: this runs after process_buf_internal,
+				 * so received_inflight was already decremented
+				 * and no received request is dropped. */
 				pthread_mutex_unlock(&se->mt_lock);
+				atomic_fetch_add_explicit(&se->exited_workers, 1,
+							  memory_order_relaxed);
+				fuse_drain_state_changed(se);
 				return NULL;
 			}
 			list_del_worker(w);
@@ -202,11 +335,16 @@ static void *fuse_do_work(void *data)
 			fuse_buf_free(&w->fbuf);
 			fuse_chan_put(w->ch);
 			free(w);
+			atomic_fetch_add_explicit(&se->exited_workers, 1,
+						  memory_order_relaxed);
+			fuse_drain_state_changed(se);
 			return NULL;
 		}
 		pthread_mutex_unlock(&se->mt_lock);
 	}
 
+	atomic_fetch_add_explicit(&se->exited_workers, 1, memory_order_relaxed);
+	fuse_drain_state_changed(se);
 	sem_post(&se->mt_finish);
 	return NULL;
 }
@@ -341,8 +479,27 @@ static int fuse_loop_start_thread(struct fuse_mt *mt)
 		}
 	}
 
+	/*
+	 * worker_total must be counted BEFORE thread creation. Otherwise a newly
+	 * created worker not yet in the thread body could let wait_drained()
+	 * observe total too small, wrongly report drained, and hand off before
+	 * that worker can stop receiving. wait_drained()/is_drained() take
+	 * drain_lock (not mt_lock), so they have no mutual exclusion with worker
+	 * creation; pre-counting only ever biases is_drained() toward NOT drained
+	 * (the safe direction). Roll back on create failure (thread exists =>
+	 * counted). Done under mt_lock, in the same critical section as
+	 * numworker++ and the !recv_paused growth guard.
+	 */
+	atomic_fetch_add_explicit(&mt->se->worker_total, 1, memory_order_relaxed);
+
 	res = fuse_start_thread(&w->thread_id, fuse_do_work, w);
 	if (res == -1) {
+		/* Roll back the pre-count: no thread was created. Broadcast so a
+		 * concurrent wait_drained() re-evaluates against the lowered
+		 * total. */
+		atomic_fetch_sub_explicit(&mt->se->worker_total, 1,
+					  memory_order_relaxed);
+		fuse_drain_state_changed(mt->se);
 		fuse_chan_put(w->ch);
 		free(w);
 		return -1;
@@ -406,6 +563,26 @@ int err;
 			fuse_log(FUSE_LOG_DEBUG,
 				 "fuse: session exited, terminating workers\n");
 
+		/*
+		 * Two distinct teardown paths must not be conflated:
+		 *
+		 *  - Drain (hot-upgrade): fuse_session_pause_receive() + statfs wakeup +
+		 *    fuse_session_wait_drained() bring every worker to a parked
+		 *    point with no request in flight and nothing in read; the
+		 *    orchestrator hands off only after that. No worker is cancelled
+		 *    mid-process, so no received request is dropped.
+		 *
+		 *  - Exit (this stock path): fuse_session_exit() was called. We
+		 *    reach a worker only once it is back at the top of its loop
+		 *    (cancellation is enabled solely around receive, disabled
+		 *    across process_buf), so pthread_cancel() here cannot abort a
+		 *    request that has been received but not yet replied -- the
+		 *    early "drop received request on exit" path was removed. This
+		 *    cancel is just the stock wakeup for workers blocked in read()
+		 *    on a plain (non-drain) shutdown; the hot-upgrade EXITING path
+		 *    instead relies on received_inflight reaching 0 and the workers
+		 *    self-exiting + join, never on forced cancellation.
+		 */
 		pthread_mutex_lock(&se->mt_lock);
 		for (w = mt.main.next; w != &mt.main; w = w->next)
 			pthread_cancel(w->thread_id);

@@ -25,6 +25,30 @@ td += executable('test_signals', 'test_signals.c',
 td += executable('test_abi', 'test_abi.c',
                  dependencies: [ libfuse_dep ],
                  install: false)
+td += executable('test_wait_drained_timeout', 'test_wait_drained_timeout.c',
+                 dependencies: [ libfuse_dep, thread_dep ],
+                 install: false)
+td += executable('test_received_inflight', 'test_received_inflight.c',
+                 dependencies: [ libfuse_dep, thread_dep ],
+                 install: false)
+td += executable('test_drop_race', 'test_drop_race.c',
+                 dependencies: [ libfuse_drainhooks_dep, thread_dep ],
+                 c_args: [ '-DFUSE_TEST_DRAIN_HOOKS' ],
+                 install: false)
+td += executable('test_drain_spawn_race', 'test_drain_spawn_race.c',
+                 dependencies: [ libfuse_drainhooks_dep, thread_dep ],
+                 c_args: [ '-DFUSE_TEST_DRAIN_HOOKS' ],
+                 install: false)
+td += executable('test_drain_cancel_safety', 'test_drain_cancel_safety.c',
+                 dependencies: [ libfuse_drainhooks_dep, thread_dep ],
+                 c_args: [ '-DFUSE_TEST_DRAIN_HOOKS' ],
+                 install: false)
+td += executable('test_drain_handoff', 'test_drain_handoff.c',
+                 dependencies: [ libfuse_dep, thread_dep ],
+                 install: false)
+td += executable('test_reset_clears_drain', 'test_reset_clears_drain.c',
+                 dependencies: [ libfuse_dep, thread_dep ],
+                 install: false)
 
 test_scripts = [ 'conftest.py', 'pytest.ini', 'test_examples.py',
                  'util.py', 'test_ctests.py', 'test_custom_io.py' ]

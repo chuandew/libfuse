@@ -222,6 +222,15 @@ FUSE_3.18 {
 		fuse_fs_statx;
 } FUSE_3.17;
 
+FUSE_3.18.2 {
+	global:
+		# controlled connection drain for hot-upgrade handoff
+		fuse_session_pause_receive;
+		fuse_session_resume_receive;
+		fuse_session_received_inflight;
+		fuse_session_wait_drained;
+} FUSE_3.18;
+
 # Local Variables:
 # indent-tabs-mode: t
 # End:

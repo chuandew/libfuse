@@ -34,6 +34,7 @@
 #include <limits.h>
 #include <errno.h>
 #include <assert.h>
+#include <time.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <stdalign.h>
@@ -3825,6 +3826,8 @@ void fuse_session_destroy(struct fuse_session *se)
 	pthread_key_delete(se->pipe_key);
 	sem_destroy(&se->mt_finish);
 	pthread_mutex_destroy(&se->mt_lock);
+	pthread_cond_destroy(&se->drain_cond);
+	pthread_mutex_destroy(&se->drain_lock);
 	pthread_mutex_destroy(&se->lock);
 	free(se->cuse_data);
 	if (se->fd != -1)
@@ -4201,6 +4204,60 @@ fuse_session_new_versioned(struct fuse_args *args,
 	pthread_mutex_init(&se->lock, NULL);
 	sem_init(&se->mt_finish, 0, 0);
 	pthread_mutex_init(&se->mt_lock, NULL);
+	atomic_init(&se->recv_paused, false);
+	atomic_init(&se->received_inflight, 0);
+	atomic_init(&se->worker_total, 0);
+	atomic_init(&se->reading, 0);
+	atomic_init(&se->parked, 0);
+	atomic_init(&se->exited_workers, 0);
+	pthread_mutex_init(&se->drain_lock, NULL);
+	{
+		/*
+		 * drain_cond drives fuse_session_wait_drained()'s timed wait;
+		 * give it a CLOCK_MONOTONIC attr so the timeout is immune to
+		 * wall-clock jumps. The untimed park cond_wait and the exit
+		 * broadcast are unaffected by the clock choice.
+		 *
+		 * The cond's clock and the deadline clock used in wait_drained
+		 * MUST match, otherwise the timeout is computed against the wrong
+		 * timescale. So check every step: only commit to CLOCK_MONOTONIC
+		 * if condattr_init + setclock + cond_init all succeed; on any
+		 * failure fall back to a default (CLOCK_REALTIME) cond, and record
+		 * the chosen clock in se->drain_clock for wait_drained to read.
+		 */
+		pthread_condattr_t cattr;
+		int cerr = pthread_condattr_init(&cattr);
+
+		if (cerr == 0) {
+			cerr = pthread_condattr_setclock(&cattr,
+							 CLOCK_MONOTONIC);
+			if (cerr == 0)
+				cerr = pthread_cond_init(&se->drain_cond,
+							 &cattr);
+			pthread_condattr_destroy(&cattr);
+		}
+		if (cerr == 0) {
+			se->drain_clock = CLOCK_MONOTONIC;
+		} else {
+			/* Fall back to the default clock; keep cond and deadline
+			 * on the same (REALTIME) timescale. */
+			err = pthread_cond_init(&se->drain_cond, NULL);
+			if (err) {
+				fuse_log(FUSE_LOG_ERR,
+					 "fuse: failed to init drain cond: %s\n",
+					 strerror(err));
+				/* drain_cond is NOT initialised here, so unwind
+				 * everything out5 does EXCEPT destroying it
+				 * (destroying an uninitialised cond is UB). */
+				sem_destroy(&se->mt_finish);
+				pthread_mutex_destroy(&se->mt_lock);
+				pthread_mutex_destroy(&se->drain_lock);
+				pthread_mutex_destroy(&se->lock);
+				goto out4;
+			}
+			se->drain_clock = CLOCK_REALTIME;
+		}
+	}
 
 	err = pthread_key_create(&se->pipe_key, fuse_ll_pipe_destructor);
 	if (err) {
@@ -4227,6 +4284,8 @@ fuse_session_new_versioned(struct fuse_args *args,
 out5:
 	sem_destroy(&se->mt_finish);
 	pthread_mutex_destroy(&se->mt_lock);
+	pthread_cond_destroy(&se->drain_cond);
+	pthread_mutex_destroy(&se->drain_lock);
 	pthread_mutex_destroy(&se->lock);
 out4:
 	fuse_opt_free_args(args);
@@ -4472,6 +4531,137 @@ void fuse_session_exit(struct fuse_session *se)
 {
 	atomic_store_explicit(&se->mt_exited, 1, memory_order_relaxed);
 	sem_post(&se->mt_finish);
+	/* Wake any worker parked on drain_cond so it observes the exit and
+	 * leaves the loop. Without this a paused worker would only be torn
+	 * down by the stock pthread_cancel fallback. The hot-upgrade EXITING
+	 * path relies on this: workers finish their received request, decrement
+	 * received_inflight, then exit on their own (no forced cancel). */
+	pthread_mutex_lock(&se->drain_lock);
+	pthread_cond_broadcast(&se->drain_cond);
+	pthread_mutex_unlock(&se->drain_lock);
+}
+
+__attribute__((no_sanitize_thread))
+void fuse_session_pause_receive(struct fuse_session *se)
+{
+	/* Set recv_paused under drain_lock, mirroring resume_receive(): the flag and
+	 * the broadcast that wakes workers onto the drain_cond sleep point
+	 * are published together, leaving no window for a missed wakeup. This
+	 * call does NOT wake a worker already blocked inside read(); the caller
+	 * must drive a statfs round-trip to pop it out (see header note). */
+	pthread_mutex_lock(&se->drain_lock);
+	/* seq_cst (paired with the seq_cst loads in the worker loop) gives the
+	 * flag prompt cross-thread visibility so paused workers settle quickly
+	 * and the drain converges. It is a convergence aid, not the handoff
+	 * barrier: the actual safe point is the drain predicate that
+	 * fuse_session_wait_drained() checks (reading / received_inflight /
+	 * parked / exited_workers vs the pre-counted worker_total), which holds
+	 * even if a worker momentarily observed a stale flag. */
+	atomic_store_explicit(&se->recv_paused, true, memory_order_seq_cst);
+	pthread_cond_broadcast(&se->drain_cond);
+	pthread_mutex_unlock(&se->drain_lock);
+}
+
+__attribute__((no_sanitize_thread))
+void fuse_session_resume_receive(struct fuse_session *se)
+{
+	pthread_mutex_lock(&se->drain_lock);
+	atomic_store_explicit(&se->recv_paused, false, memory_order_seq_cst);
+	pthread_cond_broadcast(&se->drain_cond);
+	pthread_mutex_unlock(&se->drain_lock);
+}
+
+__attribute__((no_sanitize_thread))
+int fuse_session_received_inflight(struct fuse_session *se)
+{
+	return atomic_load_explicit(&se->received_inflight,
+				    memory_order_relaxed);
+}
+
+/* Drained handoff point, evaluated under drain_lock: no worker is in read,
+ * no received request is in flight, and every managed worker is either parked
+ * at the drain pause boundary or has left the loop. */
+static __attribute__((no_sanitize_thread)) bool
+fuse_session_is_drained(struct fuse_session *se)
+{
+	int reading = atomic_load_explicit(&se->reading, memory_order_relaxed);
+	int inflight = atomic_load_explicit(&se->received_inflight,
+					    memory_order_relaxed);
+	int parked = atomic_load_explicit(&se->parked, memory_order_relaxed);
+	int exited = atomic_load_explicit(&se->exited_workers,
+					  memory_order_relaxed);
+	int total = atomic_load_explicit(&se->worker_total,
+					 memory_order_relaxed);
+
+	return reading == 0 && inflight == 0 && parked + exited == total;
+}
+
+__attribute__((no_sanitize_thread))
+int fuse_session_wait_drained(struct fuse_session *se, int timeout_ms)
+{
+	struct timespec deadline;
+	int rc = 0;
+
+	/* A negative timeout is invalid: it would build a deadline in the past
+	 * (and, via a negative tv_nsec, make pthread_cond_timedwait() itself
+	 * return EINVAL). Reject up front rather than busy-spinning on it. */
+	if (timeout_ms < 0)
+		return -EINVAL;
+
+	/*
+	 * Drained is only meaningful after fuse_session_pause_receive(): the
+	 * drained predicate (reading == 0 && received_inflight == 0 &&
+	 * parked + exited_workers == worker_total) is trivially true when no
+	 * loop is running (all counters 0), which would otherwise hand back a
+	 * bogus "0 == safe handoff point". Require recv_paused so a caller that
+	 * skipped pause_receive() (or has no running loop) is rejected instead.
+	 */
+	if (!atomic_load_explicit(&se->recv_paused, memory_order_seq_cst))
+		return -EINVAL;
+
+	/*
+	 * Build the deadline against the SAME clock drain_cond was created
+	 * with (se->drain_clock): normally CLOCK_MONOTONIC (immune to
+	 * wall-clock jumps), but CLOCK_REALTIME if the MONOTONIC condattr setup
+	 * failed at session creation. Using a clock that disagrees with the
+	 * cond's clock would make pthread_cond_timedwait() interpret the
+	 * deadline on the wrong timescale and time out wrongly.
+	 */
+	clock_gettime(se->drain_clock, &deadline);
+	deadline.tv_sec += timeout_ms / 1000;
+	deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec += 1;
+		deadline.tv_nsec -= 1000000000L;
+	}
+
+	pthread_mutex_lock(&se->drain_lock);
+	while (1) {
+		if (fuse_session_is_drained(se)) {
+			rc = 0;
+			break;
+		}
+
+		rc = pthread_cond_timedwait(&se->drain_cond,
+					    &se->drain_lock, &deadline);
+		if (rc == 0)
+			continue;	/* woken: re-evaluate the predicate */
+		if (rc == ETIMEDOUT) {
+			/* Re-check the predicate once before giving up: the
+			 * drained state may have been reached in the same
+			 * instant the deadline elapsed (the broadcast and the
+			 * timeout can race). Only then report timeout. */
+			rc = fuse_session_is_drained(se) ? 0 : -1;
+			break;
+		}
+		/* Any other error (e.g. EINVAL from a malformed deadline) is
+		 * surfaced as a negative errno instead of being swallowed into a
+		 * 0 that would spin the loop forever. */
+		rc = -rc;
+		break;
+	}
+	pthread_mutex_unlock(&se->drain_lock);
+	return rc;
 }
 
 __attribute__((no_sanitize_thread))
@@ -4479,6 +4669,20 @@ void fuse_session_reset(struct fuse_session *se)
 {
 	se->mt_exited = false;
 	se->error = 0;
+
+	/* Clear stale controlled-drain state so no residue from a previous loop
+	 * survives: a left-over recv_paused would park every worker of any later
+	 * loop (silent hang), and stale worker_total / exited_workers would skew
+	 * the fuse_session_wait_drained() predicate. The caller must ensure no
+	 * live loop worker exists when reset() runs, so these unsynchronised
+	 * stores race nothing. recv_paused keeps the seq_cst ordering it is
+	 * published with. */
+	atomic_store_explicit(&se->recv_paused, false, memory_order_seq_cst);
+	atomic_store_explicit(&se->received_inflight, 0, memory_order_relaxed);
+	atomic_store_explicit(&se->reading, 0, memory_order_relaxed);
+	atomic_store_explicit(&se->parked, 0, memory_order_relaxed);
+	atomic_store_explicit(&se->exited_workers, 0, memory_order_relaxed);
+	atomic_store_explicit(&se->worker_total, 0, memory_order_relaxed);
 }
 
 __attribute__((no_sanitize_thread))

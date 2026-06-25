@@ -64,3 +64,20 @@ pkg.generate(libraries: [ libfuse, '-lpthread' ],
 
 libfuse_dep = declare_dependency(include_directories: include_dirs,
                                  link_with: libfuse, dependencies: deps)
+
+# Test-only static build with the drain test hooks compiled in. Never installed
+# and never part of the shipped library; used by the drain regression tests to
+# make drain-related concurrency races deterministic.
+if get_option('tests')
+  libfuse_drainhooks = static_library('fuse3_drainhooks',
+                    libfuse_sources,
+                    include_directories: include_dirs,
+                    dependencies: deps,
+                    install: false,
+                    c_args: [ '-DFUSE_USE_VERSION=317',
+                              '-DFUSERMOUNT_DIR="@0@"'.format(fusermount_path),
+                              '-DFUSE_TEST_DRAIN_HOOKS' ])
+  libfuse_drainhooks_dep = declare_dependency(include_directories: include_dirs,
+                                              link_with: libfuse_drainhooks,
+                                              dependencies: deps)
+endif
